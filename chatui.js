@@ -2430,6 +2430,7 @@ if (process.env.DUMP) {
     if (cx > 0 && cy > 0) { draw(); handleClick(cx, cy); }
   }
   if (process.env.TOAST) setToast(process.env.TOAST, 60000);
+  if (process.env.EMOJI) { ui.emojiOpen = true; }
   if (process.env.ATTACH) readAttachDir(os.homedir());
   draw();
   process.exit(0);

@@ -91,6 +91,20 @@ DEMO=1 npm start
 | `Esc` | Cancelar (respuesta, borrado, adjunto, selección) o limpiar entrada |
 | `Ctrl+C` | Salir |
 
+## Capturas
+
+| Chats | Foto dentro del chat |
+|---|---|
+| ![Chats](docs/img/01-chats.png) | ![Foto](docs/img/02-foto.png) |
+
+| Contactos | Estados | Adjuntar |
+|---|---|---|
+| ![Contactos](docs/img/03-contactos.png) | ![Estados](docs/img/04-estados.png) | ![Adjuntar](docs/img/05-adjuntar.png) |
+
+| Emojis | Escribiendo |
+|---|---|
+| ![Emojis](docs/img/06-emoji.png) | ![Escribiendo](docs/img/07-escribir.png) |
+
 ## Notas
 
 - Riesgo de ban y responsabilidad: ver [Aviso legal](#aviso-legal-léeme).
