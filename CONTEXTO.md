@@ -1,150 +1,141 @@
 # Contexto del Proyecto: wa-reader
 
 > Documento portable para retomar el proyecto en otro chat o herramienta.
-> Generado: 2026-10-09 · Idioma: español
+> Actualizado: 2026-10-14 · Idioma: español
 
 ## 1. Resumen
 
-Cliente de WhatsApp que corre **100 % en la terminal** (TUI) para Linux. Permite leer y responder mensajes desde el número personal del usuario usando la librería **Baileys** (WebSocket puro, sin navegador). La interfaz está inspirada en la estética clásica de terminales Unix/Linux: fondo negro casi absoluto (`#080B0E`), verde terminal (`#39E58C`) para elementos activos/enviados, gris claro para recibidos y gris azulado para metadatos.
+Cliente de WhatsApp **100 % en la terminal** (TUI) para Linux: lee y responde mensajes del número personal con **Baileys** (WebSocket puro, sin navegador). Pestañas Chats / Contactos / Estados con recuadros arriba y ubicación `Ventana › Chat`; burbujas estilo WhatsApp, chip HOY/AYER, caja de prompt con botón ➤; fotos/stickers inline (Kitty), videos con miniatura + mpv; envío de archivos, respuesta citando (incluye historias), borrado en 2 pasos, clic de ratón + rueda, fotos de perfil e iniciales de color.
 
-**Estado actual:** funcional — diseño estilo WhatsApp (burbujas, chip HOY/AYER, compositor con píldora y botón ➤ que siempre dice a quién escribes), borrado en 2 pasos, conexión estable, recepción de mensajes arreglada (infraestructura de reintentos + `getMessage`), fotos inline en la terminal sin parpadeo (Kitty graphics + miniaturas ffmpeg; videos con miniatura y `Ctrl+P`), estados de descarga visibles (`↓` bajando / `⚠` falló con reintento `Ctrl+O` + auto-reintento al abrir el chat), respuesta citando con `Ctrl+R`, descarga automática de imágenes/video/stickers a `media/<Nombre>/` (usa `downloadMediaMessage` de Baileys con el mensaje crudo + `directPath`, con reintento de re-subida; fallos en `incoming.log`), selector de emojis y de archivos, envío de fotos/videos/docs/audios/stickers (`Ctrl+F` o `/img /video /doc /audio /sticker`), lista de contactos filtrada y clasificación Chats / Contactos / Estados.
+**Estado actual:** funcional en uso diario. Repo público `github.com/22460329-hue/wa-reader` (master, tag `v1.0.0`). AUR listo en `packaging/` sin publicar. Trabajo local SIN subir (órdenes vigentes).
 
 ## 2. Stack y tecnologías
 
 | Área | Tecnología / versión |
 |------|----------------------|
-| Lenguaje | Node.js (ESM) |
+| Lenguaje | Node.js ≥ 18 (ESM, un solo archivo) |
 | Framework WhatsApp | `@whiskeysockets/baileys` 7.0.0-rc14 |
 | Logging | `pino` (errores a `baileys.log`) |
-| QR | `qrcode` (genera `qr.png`) |
-| Terminal | ANSI truecolor (24-bit), raw mode, alt screen |
+| QR | `qrcode` (`qr.png`) + `qrcode-terminal` (QR en pantalla al vincular) |
+| Terminal | ANSI truecolor 24-bit, raw mode, alt screen, ratón SGR 1000+1006 |
+| Imágenes inline | Kitty graphics protocol (`a=t`/`a=p`/`a=d`), miniaturas ffmpeg, dimensiones ffprobe |
+| Externos opcionales | `mpv` (video en terminal, `--vo=kitty`/`tct`), `ffmpeg`, visor vía `xdg-open` |
 
 ## 3. Estructura
 
 ```text
 wa-reader/
-├── auth_info/                 # Sesión WhatsApp persistente (NO borrar salvo re-vincular)
-│   └── app-state-sync-key-*.json
-├── media/                     # Descargas por contacto: media/<Nombre>/ (estados van a la carpeta de su autor)
-├── node_modules/
-├── chatui.js                  # ÚNICO archivo funcional (TUI completo)
-├── package.json
+├── chatui.js                  # ÚNICO archivo funcional (~2400 líneas: TUI, socket, modelo, render, teclas, media)
+├── package.json               # scripts: start / demo ; engines node>=18 ; license MIT
 ├── package-lock.json
-├── store.json                 # Chats, contactos, mensajes, lidMap persistidos
-├── incoming.log               # Log de eventos messages.upsert (diagnóstico)
-├── baileys.log                # Errores de Baileys (descifrado, conexión)
-├── msgdump.jsonl              # Dump crudo de mensajes con multimedia (debug)
-└── qr.png                     # Código QR para vincular (se regenera si no hay sesión)
+├── README.md / LICENSE (MIT) / .gitignore
+├── CONTEXTO.md                # este documento
+├── packaging/aur/             # PKGBUILD + .SRCINFO + wa-reader.sh (launcher con WA_DATA_DIR)
+├── auth_info/                 # Sesión Baileys (SENSIBLE, gitignored)
+├── store.json                 # chats, contactos, mensajes, lidMap, statuses (SENSIBLE, gitignored)
+├── media/                     # <Nombre>/ por contacto + avatars/ (gitignored)
+├── incoming.log               # messages.upsert + fallos `media fail` (gitignored)
+├── baileys.log                # errores Baileys (gitignored)
+├── msgdump.jsonl              # dump crudo multimedia (gitignored)
+└── qr.png                     # QR de vinculación (gitignored)
 ```
 
 ## 4. Cómo ejecutar
 
 ### Requisitos
-- Node.js ≥ 18 (ESM)
-- Terminal con soporte truecolor y raw mode (TTY real)
-- Sesión WhatsApp ya vinculada en `auth_info/` (o escanear QR la primera vez)
+- Node.js ≥ 18, terminal truecolor con TTY real.
+- Fotos inline: **Kitty** (sin tmux, o `WA_GFX=1` con passthrough). En otra terminal: texto + `Ctrl+O`.
+- Opcional: `mpv`, `ffmpeg`/`ffprobe`, `xdg-open`.
+- Primera vez: escanear QR que sale en pantalla (`linkFlow()` si no hay `auth_info/creds.json`).
 
 ### Instalación
 ```bash
-cd /home/ceja/wa-reader
+git clone https://github.com/22460329-hue/wa-reader.git
+cd wa-reader
 npm install
 ```
 
 ### Ejecución / comandos principales
 ```bash
-# Modo normal (contactos reales)
-node chatui.js
+npm start            # o: node chatui.js (contactos reales)
+npm run demo         # DEMO=1: datos de ejemplo sin vincular
 
-# Modo demo (contactos de ejemplo: Priyanka, Amigos, Familia, Luis, Trabajo + 1 grupo)
-DEMO=1 node chatui.js
-
-# Volcado de pantalla para depuración (sin TTY)
-DUMP=1 COLS=120 ROWS=34 node chatui.js
-DEMO=1 DUMP=1 COLS=110 ROWS=30 node chatui.js
+# Volcado estático para depuración (sin TTY) + ganchos de prueba:
+DEMO=1 DUMP=1 COLS=100 ROWS=26 node chatui.js
+DUMP=1 TAB=status|chats|contacts SEL=texto MSGSEL=n MSGOFF=n INPUT=txt CURSOR=n CLICK=x,y ATTACH=1 TOAST=txt node chatui.js
 ```
 
 **Controles:**
 | Tecla | Acción |
 |-------|--------|
-| `↑` `↓` | Cambiar de chat (selección fijada por JID: los mensajes nuevos ya no te sacan ni desvían el envío) |
-| Rueda del ratón / touch | Sube y baja por los mensajes del chat (los chats se cambian con botones; `↑hist` = estás arriba; para copiar texto usa Shift) |
-| `Tab` / `Shift+Tab` | Cambiar de pestaña: Chats / Contactos / Estados (recuadros arriba; la activa en verde con no-leídos; la barra dice `Ventana › Chat`) |
-| `←` `→` (en Estados) | Pasar de un estado a otro (visor foto por foto, sin salir de la terminal) |
-| `AvPag` `RePag` o `Ctrl+↑` `Ctrl+↓` | Elegir mensaje dentro del chat activo |
-| `Supr` o `Ctrl+D` | Borrar en 2 pasos: armar (`⚠ Supr otra vez`) y confirmar; `Esc` cancela (lo propio se revoca para todos, sin deshacer) |
-| `Ctrl+O` | Ver sticker/imagen/video del mensaje elegido (descarga si falta y lo abre con tu visor) |
-| `Ctrl+P` | Reproducir video/audio/imagen en la terminal con mpv (`q` para salir) |
-| `Ctrl+R` | Responder citando el mensaje elegido con `AvPag` (o el último); `Enter` envía, `Esc` cancela |
-| `Ctrl+F` | Adjuntar archivo (selector con vista de carpetas → pie opcional → `Enter` envía) |
-| `/img /video /doc /audio /sticker <ruta> [texto]` | Enviar archivo directo (ruta con comillas si tiene espacios; `/sticker` crea sticker webp) |
-| Sección `Estados 24h` | Todos los estados del contacto de una vez, fotos inline sin teclas; solo lectura, se borran solos a las 24 h |
-| Pestaña `Contactos` | Agenda completa aunque no tengan historial, para empezar chats nuevos |
-| `:` | Abrir/cerrar selector de emojis |
-| `↑` `↓` `←` `→` (en selector) | Navegar emojis |
-| `Enter` (en selector) | Insertar emoji y cerrar |
-| `Esc` / `:` (en selector) | Cerrar sin insertar |
-| `0`–`9` (en selector) | Cambiar página de emojis |
-| Escribir + `Enter` | Enviar mensaje |
-| `Backspace` | Borrar |
-| `Esc` (en chat sin selección) | Limpiar entrada |
-| `Esc` (con mensaje elegido) | Cancelar selección de mensaje |
-| `Ctrl+C` | Salir |
+| `↑` `↓` o clic | Cambiar de chat (selección fijada por JID: no te saca ni desvía envíos) |
+| `Tab` / `Shift+Tab` o clic | Pestañas Chats / Contactos / Estados (cada una recuerda selección) |
+| Clic | Chats, pestañas, elegir mensaje (2.º clic en foto la abre), iconos 🙂📎, enviar con ➤ |
+| Rueda / touch | Subir/bajar mensajes (`↑hist` = estás arriba; Shift para copiar) |
+| Escribir + `Enter` | Enviar (en Estados responde a su última historia por su chat) |
+| `←` `→` `Inicio` `Fin` `Ctrl+A/E` | Mover cursor en la caja (vacía en Estados: elegir estado) |
+| `Backspace` / `Supr` (con texto) | Borrar atrás / adelante en el cursor |
+| `AvPag` `RePag` / `Ctrl+↑` `Ctrl+↓` | Elegir mensaje en el chat |
+| `Supr` / `Ctrl+D` (caja vacía) | Borrar en 2 pasos (armar + confirmar; `Esc` cancela; propio = para todos) |
+| `Ctrl+R` | Responder citando lo elegido (cita reconstruida si salió de caché) |
+| `Alt+R` (en su chat) | Responder a su última historia sin ir a Estados |
+| `Ctrl+O` / `Ctrl+P` | Abrir en visor / reproducir en terminal con mpv (`q` sale) |
+| `Ctrl+F` | Adjuntar (selector → pie → `Enter`); `/img /video /doc /audio /sticker <ruta> [texto]` directo |
+| `:` | Emojis (`Enter` inserta en cursor, `Esc` cierra, `0-9` páginas) |
+| `Esc` | Cancela en orden: respuesta, borrado, adjunto, selección; si no, limpia entrada |
+| `Ctrl+C` | Salir (restaura terminal y desactiva ratón) |
 
 ## 5. Puntos de entrada y archivos clave
 
 | Archivo | Rol |
 |---------|-----|
-| `chatui.js` | **Único punto de entrada**; contiene TUI, conexión WhatsApp, modelo de datos, render, teclado, descarga de media, selector de emojis |
-| `store.json` | Persistencia de chats, contactos, mensajes, mapeo LID↔PN |
-| `auth_info/` | Credenciales y estado de sesión de Baileys (clave para no re-vincular) |
-| `incoming.log` | Log línea a línea de `messages.upsert` (ver recepción) |
-| `baileys.log` | Errores internos de Baileys (descifrado, reintentos, conexión) |
-| `media/` | Archivos multimedia descargados (`<hash>.jpg|mp4|pdf...`) |
+| `chatui.js` | Todo: `linkFlow` (QR fresco), `start` (socket+eventos), modelo (`recordMessage`/`recordStatus`), render (topbar/burbujas/compositor/overlays/gfx), teclado+ratón, `downloadMedia` (crudo+`directPath`+reupload), `thumbFor` async, `openMediaSelected`/`playMediaTerminal`, `sendFile`/`sendText`, adjuntos, stickers ffmpeg |
+| `store.json` | chats, contacts, lidMap, statuses (con `media`, `mediaPath`, `dim`, `dlFail`) |
+| `media/<Nombre>/` + `media/avatars/` | Descargas por contacto; `.jpg`+`.s.png` de perfil; `.thumb.png` de vistas |
+| `incoming.log` / `baileys.log` | Diagnóstico (`media fail id=…`, decrypt errors de grupos) |
+| `packaging/aur/` | `PKGBUILD` (sha256 real del tag), `.SRCINFO`, `wa-reader.sh` (datos en `~/.local/share/wa-reader`) |
 
 ## 6. Configuración
 
 | Variable | Descripción | Obligatoria |
 |----------|-------------|-------------|
-| `DEMO` | `1` = usa contactos de ejemplo; vacío/ausente = contactos reales | No |
-| `DUMP` | Cualquier valor = vuelca un frame estático y sale (para tests) | No |
-| `COLS` | Ancho terminal simulado en `DUMP` (default 100) | No |
-| `ROWS` | Alto terminal simulado en `DUMP` (default 30) | No |
-| `QR_WIDTH` | Ancho en px del `qr.png` generado (default 320) | No |
+| `WA_DATA_DIR` | Datos (sesión, store, media, logs). Default `.` | No |
+| `WA_AUTH_DIR` | Sesión (default `<DATA_DIR>/auth_info`) | No |
+| `WA_GFX` | `1` = fuerza inline (tmux con passthrough) | No |
+| `WA_FULLDRAW` | `1` = `2J` siempre (diagnóstico; con parpadeo) | No |
+| `DEMO` / `DUMP` / `COLS` / `ROWS` / `QR_WIDTH` | Demo, volcado, tamaño simulado, ancho QR (320) | No |
+| `SEL` `TAB` `MSGSEL` `MSGOFF` `INPUT` `CURSOR` `CLICK` `ATTACH` `TOAST` | Solo `DUMP` (ver §4) | No |
 
-> Sin valores secretos: la sesión vive en `auth_info/`. No hay `.env`.
+> Sin secretos en archivos: la sesión vive en `auth_info/`. No hay `.env`.
 
 ## 7. Estado y trabajo en curso
 
-- **Rama / último commit:** (no es repo git; trabajo directo en archivos)
+- **Rama / último commit:** `master` limpio en `github.com/22460329-hue/wa-reader`, tag `v1.0.0`. Local con cambios SIN commitear (topbar reescrita, `WA_FULLDRAW`, `TOAST`, `buildQuote`, `Alt+R`, clic) — **no subir sin aviso**.
 - **Pendientes / próximos pasos:**
-  - (opcional) Re-vincular una vez (`rm -rf auth_info store.json`) para traer historial completo y nombres de todos los contactos
-  - (opcional) Notificación sonora o `notify-send` al recibir mensaje en otro chat
+  - Publicar AUR (requiere llave SSH del dueño en su cuenta).
+  - (por confirmar) Topbar invisible en vivo para el dueño pese a DUMP perfecto: bytes verificados en 3 pestañas, 26 líneas exactas, datos reales. Hipótesis abiertas: proceso vivo desactualizado o fuente/fuente-terminal. Gancho `TOAST` agregado para pruebas.
+  - (opcional) `notify-send` al recibir mensaje en otro chat.
 - **Limitaciones conocidas:**
-  - WhatsApp **no reenvía historial** a dispositivos ya vinculados; solo llegan mensajes nuevos tras el vinculado
-  - Solo **una instancia a la vez** (código 440 `connectionReplaced` si hay dos)
-  - Emojis requieren terminal con fuentes que los rendericen (Noto Color Emoji, etc.)
-  - No hay visor gráfico en la TUI; las imágenes se guardan en `media/` y se abre con herramienta externa
+  - Sin reenvío de historial a sesiones vinculadas; enlaces de fotos viejas caducan (`↓`→`⚠`, reintento `Ctrl+O`/auto).
+  - Una instancia a la vez (440 `connectionReplaced`).
+  - Cuota gfx del terminal 320MB LRU: refresco 25 s + keepalive 25 s + re-transmit al navegar.
+  - Lo propio borrado "para todos" no se recupera.
 
 ## 8. Convenciones y notas
 
-- **Paleta fija** (truecolor ANSI):
-  - `BG` `#080B0E` — fondo
-  - `SURFACE` `#0D1117` — superficies/paneles
-  - `GREEN` `#39E58C` — verde terminal (nombres, enviados, activo)
-  - `BLUE` `#3A99FF` — azul selector emojis (cursor)
-  - `RECV` `#D0D7E2` — gris claro (recibidos)
-  - `MUTED` `#8291A8` — gris azulado (horas, estado, placeholder)
-  - `BORDER` `#2E3A4A` — líneas finas
-  - `SEL_BG` `#102C22` — selección (verde oscuro translúcido)
-- **Sin dependencias pesadas** fuera de `node_modules/`
-- **Limpieza al salir:** `cleanup()` restaura terminal (`\x1b[?1049l\x1b[?25h\x1b[0m`), cierra socket
-- **Auto-guardado:** `store.json` se escribe con debounce 400 ms tras cambios
+- **Paleta:** `BG #080B0E`, `SURFACE #0D1117`, `GREEN #39E58C`, `BLUE #3A99FF`, `RECV #D0D7E2`, `MUTED #8291A8`, `BORDER #2E3A4A`, `SEL_BG #102C22`, burbujas `B_OUT #005C4B` / `B_IN #1F2C34` / texto `#E9EDEF`, iniciales `AV_COLORS` (8).
+- **Render bajo demanda:** blink solo redibuja con aviso/reloj; si no, `caretTick` (1 celda); keepalive 25 s si hay fotos.
+- **Regla de oro de filas:** ningún texto con `\n` llega a una fila (`cleanName` en nombres, `setToast` limpia avisos, `wrap`/`replace` en mensajes). Una fila partida = scroll = menú fuera. Verificado con 11 mensajes reales con `\n`.
+- **Layout exacto:** siempre `rows` líneas (con aviso se omite la última fila); `ELK` al final de cada línea; `2J` solo al redimensionar/navegar/primer frame; `a=d` conserva datos, `gfxIds.clear()` en frames con `2J`.
+- **Selección estable por JID** (`selJid`); scroll mensajes `msgOff` recortado; borrado armado `delArm` 5 s; citas `buildQuote`; LID↔PN en `lidMap`.
+- **Ratón SGR 1006:** rueda = mensajes; clic = chats/pestañas/mensajes/iconos/➤; respuestas gfx `ESC_G` se ignoran sin redibujar; Shift para copiar.
+- **Auto-guardado** `store.json` con debounce 400 ms; `dlFail` se limpia al cargar.
+- **Commits:** los hace el dueño (`jjceja`-handle `22460329-hue`, noreply). Tokens usados ya: revocar en `github.com/settings/tokens`.
 
 ## 9. Advertencias
 
-- **Riesgo de ban:** Cliente no oficial → viola ToS de WhatsApp. El usuario aceptó el riesgo.
-- **`auth_info/` y `store.json` son sensibles:** contienen claves de sesión y mensajes. No subir a repos públicos.
-- **`baileys.log` e `incoming.log` crecen:** rotar o limpiar periódicamente si se usa en producción.
-- **`msgdump.jsonl`** se genera solo en modo debug (tiene `message` completo); puede ser grande.
-- **Re-vinculado necesario para historial completo:** si faltan contactos/chats antiguos, borrar `auth_info/` y `store.json` y volver a escanear QR.
-- **Node 24+:** `pino.destination({sync:false})` lanza warning `sonic boom is not ready yet` al cerrar; inofensivo.
+- **Riesgo de ban:** cliente no oficial, viola ToS de WhatsApp. Proyecto solo-puente, sin afiliación con WhatsApp/Meta (ver README aviso legal).
+- **`auth_info/` y `store.json` son sensibles** (gitignored). Verificado 2026-10-14: **ningún token/secreto** en archivos versionados.
+- **`baileys.log` e `incoming.log` crecen**; `msgdump.jsonl` puede ser grande.
+- **Re-vinculado para historial completo:** borrar `auth_info/` + `store.json` y re-escanear.
+- **Node 24+:** warning `sonic boom is not ready yet` al cerrar (inofensivo, solo DUMP).

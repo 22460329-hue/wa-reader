@@ -34,6 +34,7 @@ La primera vez sale el **QR en la pantalla**: escanéalo desde WhatsApp y entras
 - ↩️ Responder citando (`Ctrl+R`), borrar en 2 pasos (`Supr`), ver en visor externo (`Ctrl+O`) o reproducir en terminal (`Ctrl+P` con mpv)
 - 📁 Descargas organizadas por contacto en `media/<Nombre>/`
 - ⌨️ Rueda del ratón / touch para subir y bajar por los mensajes
+- 👤 Fotos de perfil en la lista y el chat (o inicial de color si no hay foto) + nombre de color de quién habla en grupos
 
 ## Requisitos
 
@@ -71,10 +72,15 @@ DEMO=1 npm start
 |-------|--------|
 | `↑` `↓` | Cambiar de chat (la selección no se mueve sola al llegar mensajes) |
 | `Tab` / `Shift+Tab` | Pestañas: Chats / Contactos / Estados |
+| Clic | Abrir chats y pestañas, elegir mensajes (otro clic en foto la abre), iconos 🙂📎 y enviar con ➤ |
+| Rueda / touch | Subir y bajar por los mensajes (`↑hist` = estás arriba) |
 | Rueda / touch | Subir y bajar por los mensajes (`↑hist` = estás arriba) |
 | Escribir + `Enter` | Enviar al chat visible en la caja |
 | `←` `→` `Inicio` `Fin` | Mover el cursor en la caja (editar en medio del texto) |
 | `Ctrl+R` | Responder citando el mensaje elegido (`AvPag` o el último) |
+| Citas `┃` | Lo citado se ve sobre la burbuja (tuyo y ajeno) |
+| Escribir + `Enter` (en Estados) | Responde directo a su última historia por su chat |
+| `Alt+R` (en su chat) | Responder a su última historia sin ir a Estados |
 | `AvPag` `RePag` o `Ctrl+↑` `Ctrl+↓` | Elegir mensaje dentro del chat |
 | `Supr` o `Ctrl+D` | Con texto: borra letra; vacía: borra mensaje en 2 pasos (tuyo = para todos) |
 | `Ctrl+O` | Abrir foto/video/sticker en tu visor |

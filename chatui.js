@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import pino from "pino";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, execFile } from "node:child_process";
 
 const logger = pino({ level: "error" }, pino.destination({ dest: "baileys.log", sync: false }));
 
@@ -27,7 +27,8 @@ const logger = pino({ level: "error" }, pino.destination({ dest: "baileys.log", 
 // Uso:  npm start               (contactos reales)
 //       npm run demo            (datos de ejemplo para ver el diseño)
 //
-//   ↑ / ↓      cambiar de chat (te quedas dentro hasta que cambies tú)
+//   ↑ / ↓ o clic  cambiar de chat (te quedas dentro hasta que cambies tú)
+//   clic        pestañas, elegir mensaje (otro clic en foto la abre), iconos 🙂📎, botón ➤ envía
 //   Tab        cambiar de pestaña: Chats / Contactos / Estados
 //   ← → / Inicio / Fin  mover el cursor en la caja (vacía en Estados: pasar estados)
 //   AvPag/RePag o Ctrl+↑/Ctrl+↓  elegir mensaje dentro del chat
@@ -35,8 +36,9 @@ const logger = pino({ level: "error" }, pino.destination({ dest: "baileys.log", 
 //   Ctrl+O     ver sticker/imagen/video (abre el archivo con tu visor)
 //   Ctrl+P     reproducir video/audio/imagen en la terminal con mpv
 //   Ctrl+R     responder citando el mensaje elegido (luego Enter envía)
+//   Alt+R      responder a su última historia en este chat (luego Enter envía)
 //   Ctrl+F     adjuntar archivo (selector) o escribe /img /video /doc /audio /sticker <ruta> [texto]
-//   Estados    ver estados con fotos inline (solo lectura; Ctrl+R responde por chat)
+//   Estados    ver estados con fotos inline; escribe + Enter y le respondes por su chat
 //   texto      escribir (siempre se envía al chat visible en el encabezado)
 //   Enter      enviar al chat activo
 //   Backspace  borrar
@@ -59,6 +61,7 @@ const contacts = new Map();
 const lidMap = new Map(); // @lid <-> @s.whatsapp.net
 const statusMap = new Map(); // autorJid -> { author, name, items: [], lastTs, unread } (estados 24h)
 let sock = null;
+let selfJid = null; // mi JID (para marcar "tú" en citas)
 let connectGen = 0;
 let saveTimer = null;
 let reconnecting = false;
@@ -298,51 +301,190 @@ async function downloadMedia(msgId, mediaInfo) {
     return null;
   }
 }
+// ---------------- fotos de perfil ----------------
+const AV_COLORS = [
+  [57, 229, 140], [58, 153, 255], [255, 171, 64], [186, 104, 255],
+  [255, 109, 141], [64, 224, 208], [255, 235, 59], [255, 138, 101],
+];
+function avColorFor(name) {
+  let h = 0;
+  for (const ch of String(name || "?")) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return AV_COLORS[h % AV_COLORS.length];
+}
+function avInitial(name) {
+  const s = String(name || "?").replace(/^📖 /, "").trim();
+  return [...s][0] || "?";
+}
+const avatarCache = new Map(); // jid -> { photo: thumb } | null (sin foto)
+const avatarFetching = new Set();
+const avatarPending = [];
+function avatarJidFor(entry) {
+  if (!entry) return null;
+  if (entry.isStatus) return entry.author;
+  return entry.jid;
+}
+function avatarDisplay(jid, name) {
+  // { kind: 'photo', thumb } o { kind: 'initial', initial, color } (siempre hay algo que mostrar)
+  if (!jid || String(jid).endsWith("@demo")) return { kind: "initial", initial: avInitial(name), color: avColorFor(name) };
+  const e = avatarCache.get(jid);
+  if (e?.photo) return { kind: "photo", thumb: e.photo };
+  return { kind: "initial", initial: avInitial(name), color: avColorFor(name) };
+}
+function queueAvatar(jid) {
+  if (!jid || !sock || String(jid).endsWith("@demo") || String(jid).startsWith("status:")) return;
+  if (avatarCache.has(jid) || avatarFetching.has(jid)) return;
+  if (avatarFetching.size >= 4) {
+    if (!avatarPending.includes(jid)) avatarPending.push(jid);
+    return;
+  }
+  runAvatar(jid);
+}
+function runAvatar(jid) {
+  avatarFetching.add(jid);
+  (async () => {
+    const done = (photo) => {
+      avatarFetching.delete(jid);
+      const nxt = avatarPending.shift();
+      if (nxt) runAvatar(nxt);
+      avatarCache.set(jid, photo ? { photo } : null);
+      draw();
+    };
+    try {
+      const url = await sock.profilePictureUrl(jid, "image");
+      if (!url) throw new Error("sin foto");
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("http " + res.status);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const isJpg = buf.length > 100 && buf[0] === 0xff && buf[1] === 0xd8;
+      const isPng = buf.length > 100 && buf[0] === 0x89 && buf[1] === 0x50;
+      if (!isJpg && !isPng) throw new Error("formato");
+      const dir = path.join(MEDIA_DIR, "avatars");
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      const base = path.join(dir, String(jid).replace(/[^a-zA-Z0-9]/g, "_"));
+      fs.writeFileSync(base + ".img", buf);
+      const out = base + ".s.png";
+      execFile("ffmpeg", ["-y", "-v", "error", "-i", base + ".img", "-vf", "scale=96:-2", out], { timeout: 20000 }, () => {
+        try {
+          done(fs.existsSync(out) ? out : null);
+        } catch { done(null); }
+      });
+    } catch { done(null); }
+  })();
+}
+function ensureAvatars() {
+  if (!sock || !connected || suspended) return;
+  const now = Date.now();
+  if (now - (ensureAvatars.ts || 0) < 8000) return;
+  ensureAvatars.ts = now;
+  for (const it of getFlatList().slice(0, 30)) queueAvatar(avatarJidFor(it));
+  const a = getActive();
+  if (a) queueAvatar(a.isStatus ? a.author : a.jid);
+}
 // ---------------- imágenes en la terminal (protocolo gráfico de Kitty) ----------------
 const IN_TMUX = !!(process.env.TMUX || /^(screen|tmux)/.test(process.env.TERM || ""));
 const KITTY_GFX = process.env.WA_GFX === "1" ? true : (!!(process.env.KITTY_WINDOW_ID || process.env.TERM === "xterm-kitty") && !IN_TMUX);
-const IMG_ROWS = 10; // alto reservado en celdas para cada foto/video
-const gfxIds = new Map(); // archivo -> id de imagen transmitida
+const IMG_ROWS = 6; // alto reservado en celdas para cada foto/video (compactas: más por pantalla)
+const gfxIds = new Map(); // archivo -> { id, ts } (se re-transmite si el terminal la soltó)
 let gfxNextId = 1;
+const GFX_TTL = 25000; // ms que se confía en la memoria del terminal
 let gfxQueue = []; // secuencias de transmisión pendientes del frame actual
-// Miniatura PNG (480px) junto al original; null si no se puede (no-kitty, sin ffmpeg…)
-const thumbFail = new Set(); // archivos que ya fallaron: no reintentar en la sesión (no trabar el render)
-function thumbFor(m) {
+// Miniatura PNG junto al original. Si ya existe se devuelve; si no, se genera EN FONDO
+// (poco a poco: el chat muestra el esqueleto y la foto aparece sola al estar lista).
+const thumbFail = new Set(); // archivos que ya fallaron: no reintentar en la sesión
+const thumbJobs = new Set();
+const thumbQueue = [];
+let thumbRunning = 0;
+function thumbFor(m, near) {
   if (!KITTY_GFX || !m?.mediaPath) return null;
   const t = m.media?.type;
   if (t !== "image" && t !== "video" && t !== "sticker") return null;
-  if (thumbFail.has(m.mediaPath)) return null;
   const tp = `${m.mediaPath}.thumb.png`;
   try {
     if (fs.existsSync(tp)) return tp;
   } catch { return null; }
+  if (thumbFail.has(tp) || thumbJobs.has(tp) || !near) return null;
   try {
     if (fs.statSync(m.mediaPath).size > 60 * 1024 * 1024) return null; // muy pesado: solo Ctrl+P
   } catch { return null; }
-  try {
-    const args = t === "video"
-      ? ["-y", "-v", "error", "-ss", "1", "-i", m.mediaPath, "-vframes", "1", "-vf", "scale=480:-2", tp]
-      : ["-y", "-v", "error", "-i", m.mediaPath, "-vf", "scale=480:-2", tp];
-    const r = spawnSync("ffmpeg", args, { stdio: "ignore", timeout: 20000 });
-    if (r?.status === 0 && fs.existsSync(tp)) return tp;
-  } catch {}
-  thumbFail.add(m.mediaPath);
+  if (thumbRunning >= 3) {
+    if (!thumbQueue.some((q) => q.tp === tp)) thumbQueue.push({ m, tp, t });
+    return null;
+  }
+  runThumb(m, tp, t);
   return null;
 }
-// Transmite el PNG una vez por sesión; devuelve su id (encola los datos al frame)
+function runThumb(m, tp, t) {
+  thumbJobs.add(tp);
+  thumbRunning++;
+  const args = t === "video"
+    ? ["-y", "-v", "error", "-ss", "1", "-i", m.mediaPath, "-vframes", "1", "-vf", "scale=384:-2", tp]
+    : ["-y", "-v", "error", "-i", m.mediaPath, "-vf", "scale=384:-2", tp];
+  execFile("ffmpeg", args, { timeout: 30000 }, () => {
+    thumbRunning--;
+    thumbJobs.delete(tp);
+    const nxt = thumbQueue.shift();
+    if (nxt) runThumb(nxt.m, nxt.tp, nxt.t);
+    try {
+      if (fs.existsSync(tp)) draw();
+      else thumbFail.add(tp);
+    } catch { thumbFail.add(tp); }
+  });
+}
+const dimFail = new Set(); // sin dimensiones legibles en esta sesión
+const dimProbing = new Set();
+function probeDim(m, thumb) {
+  if (!m || m.dim || !thumb || dimFail.has(thumb) || dimProbing.has(thumb)) return;
+  dimProbing.add(thumb);
+  execFile("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", thumb], { timeout: 15000 }, (err, out) => {
+    dimProbing.delete(thumb);
+    const mt = String(out || "").trim().match(/^(\d+),(\d+)$/);
+    if (err || !mt) { dimFail.add(thumb); return; }
+    m.dim = { w: Number(mt[1]), h: Number(mt[2]) };
+    saveStore();
+    draw();
+  });
+}
+// Transmite el PNG y devuelve su id (encola los datos al frame).
+// Si el terminal soltó la imagen (pasa con varias fotos), se re-transmite sola cada GFX_TTL.
 function gfxEnsure(file) {
-  if (gfxIds.has(file)) return gfxIds.get(file);
+  const now = Date.now();
+  const cur = gfxIds.get(file);
+  if (cur && now - cur.ts < GFX_TTL) return cur.id;
   let buf;
   try { buf = fs.readFileSync(file); } catch { return null; }
   if (!buf?.length || buf.length > 5 * 1024 * 1024) return null;
-  const id = gfxNextId++;
+  const id = cur ? cur.id : gfxNextId++;
   const b64 = buf.toString("base64");
   for (let i = 0; i < b64.length; i += 4096) {
     const last = i + 4096 >= b64.length;
     gfxQueue.push(`\x1b_Ga=t,i=${id},f=100,m=${last ? 0 : 1};${b64.slice(i, i + 4096)}\x1b\\`);
   }
-  gfxIds.set(file, id);
+  gfxIds.set(file, { id, ts: now });
   return id;
+}
+function afterDownload(m, file) {
+  if (!file) {
+    m.dlFail = true;
+    m.dlFailTs = Date.now();
+    draw();
+    return;
+  }
+  m.mediaPath = file;
+  m.dlFail = false;
+  saveStore();
+  probeFileDim(m, file);
+  draw();
+}
+function probeFileDim(m, file) {
+  if (!file || m.dim) return;
+  execFile("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file], { timeout: 15000 }, (err, out) => {
+    const mt = String(out || "").trim().match(/^(\d+),(\d+)$/);
+    if (!err && mt) {
+      m.dim = { w: Number(mt[1]), h: Number(mt[2]) };
+      saveStore();
+      draw();
+    }
+  });
 }
 // Reintenta descargar lo visible que aún no bajó (fotos viejas al abrir el chat)
 const dlInflight = new Set();
@@ -365,16 +507,7 @@ function ensureVisibleMedia() {
     dlInflight.add(m.id);
     downloadMedia(m.id, m.media).then((file) => {
       dlInflight.delete(m.id);
-      if (file) {
-        m.mediaPath = file;
-        m.dlFail = false;
-        saveStore();
-        draw();
-      } else {
-        m.dlFail = true;
-        m.dlFailTs = Date.now();
-        draw();
-      }
+      afterDownload(m, file);
     });
   }
 }
@@ -391,10 +524,10 @@ function ensureChat(jid, name) {
 function nameFor(jid) {
   if (!jid) return "(ninguno)";
   const c = chats.get(jid) || chats.get(alias(jid));
-  if (c?.name) return c.name;
-  if (contacts.get(jid)) return contacts.get(jid);
-  if (contacts.get(alias(jid))) return contacts.get(alias(jid));
-  return String(jid).split("@")[0];
+  if (c?.name) return cleanName(c.name);
+  if (contacts.get(jid)) return cleanName(contacts.get(jid));
+  if (contacts.get(alias(jid))) return cleanName(contacts.get(alias(jid)));
+  return cleanName(String(jid).split("@")[0]);
 }
 function extractText(message) {
   if (!message) return null;
@@ -430,6 +563,42 @@ function extractText(message) {
   if (m.audioMessage) return "[audio]";
   if (m.stickerMessage) return "[sticker]";
   return null;
+}
+// Cita de una respuesta: { text, participant, stanzaId } o null
+function extractQuote(message) {
+  let m = message;
+  for (let i = 0; i < 6 && m; i++) {
+    const ci = m.conversation ? null : (
+      m.extendedTextMessage?.contextInfo || m.imageMessage?.contextInfo ||
+      m.videoMessage?.contextInfo || m.documentMessage?.contextInfo ||
+      m.audioMessage?.contextInfo || m.stickerMessage?.contextInfo || null
+    );
+    if (ci?.quotedMessage) {
+      return {
+        text: extractText(ci.quotedMessage) || "[archivo]",
+        participant: ci.participant || null,
+        stanzaId: ci.stanzaId || null,
+      };
+    }
+    if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+    else if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+    else if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+    else if (m.viewOnceMessageV2Extension?.message) m = m.viewOnceMessageV2Extension.message;
+    else if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+    else if (m.editedMessage?.message) m = m.editedMessage.message;
+    else if (m.protocolMessage?.editedMessage) m = m.protocolMessage.editedMessage;
+    else break;
+  }
+  return null;
+}
+function quoteName(participant, fallback) {
+  if (!participant) return fallback || "alguien";
+  if (selfJid && (participant === selfJid || alias(participant) === selfJid || participant === alias(selfJid))) return "tú";
+  return cleanName(contacts.get(participant) || contacts.get(alias(participant)) || nameFor(participant) || fallback || "alguien");
+}
+function findOrigMessage(msgId) {
+  if (!msgId) return null;
+  return findStatusItem(msgId) || [...chats.values()].flatMap((c) => c.messages || []).find((x) => x.id === msgId) || null;
 }
 function logRaw(m) {
   try {
@@ -494,7 +663,9 @@ function recordMessage(msg, { live = false } = {}) {
   if (msg.key.id && c.messages.some((m) => m.id === msg.key.id)) return c;
   c.lastTs = Math.max(c.lastTs || 0, ts);
   if (!fromMe) c.unread = (c.unread || 0) + 1;
-  c.messages.push({ id: msg.key.id, fromMe, text: text || `[${media?.type || "archivo"}]`, ts, name: fromMe ? "tú" : msg.pushName || nameFor(jid), media: media ? { ...media, remoteJid: jid } : media, participant: msg.key?.participant || null, remoteJid: jid });
+  const qraw = extractQuote(content);
+  const quote = qraw ? { text: qraw.text, name: quoteName(qraw.participant, fromMe ? "tú" : msg.pushName || nameFor(jid)) } : null;
+  c.messages.push({ id: msg.key.id, fromMe, text: text || `[${media?.type || "archivo"}]`, ts, name: fromMe ? "tú" : msg.pushName || nameFor(jid), media: media ? { ...media, remoteJid: jid } : media, participant: msg.key?.participant || null, remoteJid: jid, quote });
   if (c.messages.length > MAX_MSGS_PER_CHAT) c.messages.splice(0, c.messages.length - MAX_MSGS_PER_CHAT);
   if (live) saveStore();
   return c;
@@ -518,7 +689,7 @@ function contactList() {
     if (!hasRealName(c.jid, c.name)) continue;
     if (!c.lastTs && (!c.messages || c.messages.length === 0)) continue;
     const key = repKey(c.jid);
-    if (!byJid.has(key)) byJid.set(key, { jid: key, name: c.name || nameFor(c.jid), lastTs: c.lastTs || 0 });
+    if (!byJid.has(key)) byJid.set(key, { jid: key, name: cleanName(c.name || nameFor(c.jid)), lastTs: c.lastTs || 0 });
   }
   return [...byJid.values()].sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0) || a.name.localeCompare(b.name));
 }
@@ -549,7 +720,9 @@ function recordStatus(msg, { live = false } = {}) {
   if (msg.key.id && e.items.some((m) => m.id === msg.key.id)) return e;
   e.lastTs = Math.max(e.lastTs || 0, ts);
   if (!fromMe) e.unread = (e.unread || 0) + 1;
-  e.items.push({ id: msg.key.id, fromMe, text: text || `[${media?.type || "archivo"}]`, ts, name: fromMe ? "tú" : e.name || nm || author.split("@")[0], media: media ? { ...media, remoteJid: "status@broadcast", author } : media, participant: author, remoteJid: "status@broadcast" });
+  const sqraw = extractQuote(content);
+  const squote = sqraw ? { text: sqraw.text, name: quoteName(sqraw.participant, fromMe ? "tú" : e.name || nm) } : null;
+  e.items.push({ id: msg.key.id, fromMe, text: text || `[${media?.type || "archivo"}]`, ts, name: fromMe ? "tú" : e.name || nm || author.split("@")[0], media: media ? { ...media, remoteJid: "status@broadcast", author } : media, participant: author, remoteJid: "status@broadcast", quote: squote });
   if (e.items.length > 100) e.items.splice(0, e.items.length - 100);
   if (live) saveStore();
   return e;
@@ -565,7 +738,7 @@ function pruneStatuses() {
 function statusList() {
   pruneStatuses();
   return [...statusMap.values()]
-    .map((e) => ({ jid: statusJid(e.author), name: `📖 ${e.name || e.author.split("@")[0]}`, lastTs: e.lastTs || 0, unread: e.unread || 0, isStatus: true, author: e.author, count: e.items.length }))
+    .map((e) => ({ jid: statusJid(e.author), name: `📖 ${cleanName(e.name || e.author.split("@")[0])}`, lastTs: e.lastTs || 0, unread: e.unread || 0, isStatus: true, author: e.author, count: e.items.length }))
     .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
 }
 function findStatusItem(msgId) {
@@ -698,11 +871,11 @@ const TABS = [
   { id: "status", label: "Estados" },
 ];
 const tabState = {}; // tabId -> { sel, selJid, top } (cada pestaña recuerda dónde estabas)
-function switchTab(dir) {
+function gotoTab(id) {
+  if (ui.tab === id) return;
   tabState[ui.tab] = { sel: ui.sel, selJid: ui.selJid, top: ui.top };
-  const ids = TABS.map((t) => t.id);
-  ui.tab = ids[(ids.indexOf(ui.tab) + dir + ids.length) % ids.length];
-  const s = tabState[ui.tab] || {};
+  ui.tab = id;
+  const s = tabState[id] || {};
   ui.sel = s.sel || 0;
   ui.selJid = s.selJid || null;
   ui.top = s.top || 0;
@@ -710,7 +883,103 @@ function switchTab(dir) {
   ui.replyTo = null;
   ui.delArm = null;
   ui.msgOff = 0;
-  setToast(`Pestaña: ${TABS.find((t) => t.id === ui.tab).label} (Tab para cambiar)`);
+  needClear = true; // navegación: limpieza total
+  setToast(`Pestaña: ${TABS.find((t) => t.id === id).label} (Tab para cambiar)`);
+}
+function switchTab(dir) {
+  const ids = TABS.map((t) => t.id);
+  gotoTab(ids[(ids.indexOf(ui.tab) + dir + ids.length) % ids.length]);
+}
+// Responder al estado desde su chat (Alt+R): cita su última historia en este chat.
+function replyToStatus() {
+  const active = getActive();
+  if (!active || active.isStatus) { setReplyTo(); return; }
+  if (isGroupJid(active.jid)) { setToast("Abre su chat directo para responder su estado"); draw(); return; }
+  if (String(active.jid).endsWith("@demo")) { setToast("Contacto de ejemplo"); draw(); return; }
+  pruneStatuses();
+  const cands = [active.jid, alias(active.jid)].filter(Boolean);
+  let entry = null;
+  for (const [author, e] of statusMap) {
+    if (cands.includes(author)) { entry = e; break; }
+  }
+  const items = entry?.items || [];
+  const last = items[items.length - 1];
+  if (!last || !buildQuote(last)) {
+    setToast("No tiene estados recientes (duran 24 h)");
+    draw();
+    return;
+  }
+  ui.replyTo = {
+    msgId: last.id,
+    participant: last.participant || entry.author,
+    snippet: String(last.text).replace(/\s+/g, " ").slice(0, 40),
+    to: active.jid,
+  };
+  setToast(`↩ Respondes a su estado: ${ui.replyTo.snippet} (escribe + Enter)`);
+  draw();
+}
+// Cita para responder: cruda si está en caché; si no, reconstruida del texto
+// guardado (historias viejas de otra sesión también se pueden responder).
+function buildQuote(item) {
+  if (!item) return null;
+  const raw = item.id && msgCache.get(item.id);
+  if (raw?.message) return raw.message;
+  const txt = String(item.text || "");
+  if (item.media?.type === "image") return { imageMessage: { caption: txt } };
+  if (item.media?.type === "video") return { videoMessage: { caption: txt } };
+  if (item.media?.type === "sticker") return { stickerMessage: {} };
+  if (item.media?.type === "audio") return { audioMessage: {} };
+  if (item.media?.type === "document") return { documentMessage: { caption: txt } };
+  return { conversation: txt };
+}
+// Clic de ratón: chats, fotos, pestañas, iconos y enviar
+function handleClickSGR(seq) {
+  const m = seq.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
+  if (!m || m[4] !== "M") return;
+  if (Number(m[1]) & 64) return; // rueda: ya atendida
+  handleClick(Number(m[2]), Number(m[3]));
+}
+function handleClick(x, y) {
+  const L = ui._layout;
+  if (!L || suspended) return;
+  if (y <= 2) {
+    const t = (L.tabBoxes || []).find((b) => x >= b.x0 && x <= b.x1);
+    if (t) { gotoTab(t.id); draw(); }
+    return;
+  }
+  if (y < 3 || y > L.rows) return;
+  if (x <= L.leftW) {
+    const idx = Math.floor(((ui.top || 0) + (y - 3)) / 2);
+    const flat = getFlatList();
+    if (idx >= 0 && idx < flat.length) { setSel(idx, flat); draw(); }
+    return;
+  }
+  if (x === L.leftW + 1) return; // separador
+  if (L.sendBtn && y === L.sendBtn.r && x >= L.sendBtn.c0 && x <= L.sendBtn.c1) { pressEnter(); draw(); return; }
+  if (L.iconBtns && y === L.iconBtns.r) {
+    if (x >= L.iconBtns.e0 && x <= L.iconBtns.e1) {
+      if (ui.emojiOpen) ui.emojiOpen = false;
+      else { ui.emojiOpen = true; ui.emojiSel = 0; ui.emojiPage = 0; }
+      draw();
+      return;
+    }
+    if (x >= L.iconBtns.a0 && x <= L.iconBtns.a1) { openAttach(); return; }
+  }
+  const k = (y - 3) - 3 - (L.padTop || 0);
+  if (k < 0 || k >= (L.shownLen || 0)) return;
+  const msgIdx = (L.rowMsg || [])[(L.winStart || 0) + k];
+  if (msgIdx == null) return;
+  const active = getActive();
+  const { msgs } = activeMessages(active);
+  if (!msgs.length) return;
+  const off = msgs.length - 1 - msgIdx;
+  if (off < 0 || off >= msgs.length) return;
+  if (ui.msgSel === off) {
+    if (msgs[msgIdx]?.media) openMediaSelected(); // segundo clic en foto: abrir
+  } else {
+    ui.msgSel = off; // primer clic: elegir
+    draw();
+  }
 }
 function markRead(jid) {
   if (isStatusJid(jid)) {
@@ -744,7 +1013,7 @@ function contactBookList() {
     const chat = chatFor(jid) || (a ? chatFor(a) : null);
     byJid.set(key, {
       jid: key,
-      name: nm || String(key).split("@")[0],
+      name: cleanName(nm || String(key).split("@")[0]),
       lastTs: Math.max(prev?.lastTs || 0, chat?.lastTs || 0),
       unread: chat?.unread || 0,
       isContact: true,
@@ -777,6 +1046,7 @@ function setSel(idx, flat) {
   ui.sel = idx;
   ui.selJid = list[idx].jid;
   ui.msgOff = 0; // ...y vuelve al fondo del chat
+  needClear = true; // navegación: limpieza total
   ui.msgSel = null; // cambiar de chat cancela selección de mensaje
   ui.replyTo = null; // ...y la respuesta pendiente
   ui.delArm = null; // ...y el borrado armado
@@ -852,7 +1122,7 @@ function render() {
   const items = flat.map((it, idx) => ({ kind: "chat", it, ci: idx }));
 
   const left = [];
-  left.push(cell("─".repeat(leftW), leftW, BORDER, BG));
+  left.push(cell("━".repeat(leftW), leftW, BORDER, BG));
   left.push(cell("─".repeat(leftW), leftW, BORDER, BG));
 
   const listArea = rows - 3;
@@ -870,6 +1140,7 @@ function render() {
   if (selEnd > ui.top + listArea) ui.top = selEnd - listArea;
   ui.top = Math.max(0, Math.min(ui.top, Math.max(0, total - listArea)));
 
+  const avSeqs = []; // fotos de perfil: { row, col, thumb } en coords de terminal
   const lrows = [];
   items.forEach((it, i) => {
     const s = itemStart[i];
@@ -884,12 +1155,27 @@ function render() {
       const nameFg = sel ? GREEN : RECV;
       const unread = it.it.unread || 0;
       const dotW = unread ? 2 : 0;
+      const avW = 4; // columna de foto/inicial
+      const av = avatarDisplay(avatarJidFor(it.it), it.it.name);
+      const li0 = lrows.length; // índice en lrows de la primera fila (terminal: li0+4)
       lrows.push(row([
-        { text: " " + (unread ? "● " : ""), w: 1 + dotW, fg: GREEN, bg: bgc, b: true },
-        { text: it.it.name, w: leftW - timeW - 1 - dotW, fg: nameFg, bg: bgc, b: sel },
+        { text: "", w: avW, bg: bgc },
+        { text: (sel ? "▸" : " ") + (unread ? "● " : ""), w: 1 + dotW, fg: GREEN, bg: bgc, b: true },
+        { text: it.it.name, w: leftW - avW - timeW - 1 - dotW, fg: nameFg, bg: bgc, b: sel },
         { text: timeLabel(it.it.lastTs), w: timeW, fg: MUTED, bg: bgc, align: "right" },
       ]));
-      lrows.push(row([{ text: " " + previewFor(it.it.jid), w: leftW, fg: MUTED, bg: bgc }]));
+      if (av.kind === "photo") {
+        avSeqs.push({ row: li0 + 4, col: 1, thumb: av.thumb });
+        lrows.push(row([
+          { text: "", w: avW, bg: bgc },
+          { text: " " + previewFor(it.it.jid), w: leftW - avW, fg: MUTED, bg: bgc },
+        ]));
+      } else {
+        lrows.push(row([
+          { text: av.initial, w: avW, fg: BG, bg: av.color, b: true, align: "center" },
+          { text: " " + previewFor(it.it.jid), w: leftW - avW, fg: MUTED, bg: bgc },
+        ]));
+      }
     }
   });
   for (let i = lrows.length; i < listArea; i++) lrows.push(row([{ text: "", w: leftW, bg: BG }]));
@@ -904,10 +1190,15 @@ function render() {
   // fila 0: nombre + reloj
   const activeIsStatus = !!active?.isStatus;
   const activeEntry = activeIsStatus ? statusMap.get(active.author) : null;
+  const headAvJid = active ? (activeIsStatus ? active.author : active.jid) : null;
+  const headAvName = active ? (activeIsStatus ? active.name : nameFor(active.jid)) : "—";
+  const headAv = avatarDisplay(headAvJid, headAvName);
   right.push(row([
-    { text: " " + (active ? (activeIsStatus ? active.name : nameFor(active.jid)) : "—"), w: rightW - 7, fg: GREEN, bg: BG, b: true },
+    { text: " " + (active ? (activeIsStatus ? active.name : nameFor(active.jid)) : "—"), w: rightW - 14, fg: GREEN, bg: BG, b: true },
     { text: hhmm(Date.now() / 1000), w: 7, fg: MUTED, bg: BG, align: "right" },
+    { text: headAv.kind === "photo" ? "" : (headAv.initial || ""), w: 7, fg: BG, bg: headAv.kind === "photo" ? BG : headAv.color, b: true, align: "center" },
   ]));
+  if (headAv.kind === "photo") avSeqs.push({ row: 3, col: leftW + rightW - 5, thumb: headAv.thumb });
   // fila 1: estado (siempre muestra dónde estás para no enviar a otro chat)
   const isGrp = active && isGroupJid(active.jid);
   const baseStatus = activeIsStatus
@@ -923,18 +1214,29 @@ function render() {
     ? `${baseStatus} · ▸ (Supr Ctrl+O Ctrl+P Ctrl+R Esc)`
     : `${baseStatus} · Tab ↑↓ · Ctrl+F 📎 · Ctrl+O · Ctrl+P · Ctrl+R${ui.msgOff > 0 ? " · ↑hist" : ""}`;
   right.push(null); // estado: se rellena abajo ya con el scroll medido
-  // fila 2: separador
-  right.push(cell("─".repeat(rightW), rightW, BORDER, BG));
+  // fila 2: separador pesado
+  right.push(cell("━".repeat(rightW), rightW, BORDER, BG));
 
   // mensajes
   const msgArea = Math.max(1, inputRuleRow - msgStart);
   const mrows = [];
-  const gfxPlaces = []; // { mrowsIdx, id, cols } -> se convierten a filas de terminal tras el slice
+  const gfxPlaces = []; // { mrowsIdx, thumb, cols, col } pendientes; se transmiten solo si visibles
+  rowMsg = []; // mrowsIdx -> índice del mensaje (clic)
   gfxQueue = [];
-  const imgCols = Math.max(10, Math.min(rightW - 8, 44));
-  const pushMsg = (m, isSel) => {
+  const imgCols = Math.max(10, Math.min(rightW - 8, 32));
+  const pushMsg = (m, isSel, near) => {
     const rowBg = isSel ? SEL_BG : BG;
     const t = hhmm(m.ts);
+    if (m.quote) {
+      const qn = m.quote.name || "alguien";
+      const qt = String(m.quote.text || "").replace(/\s+/g, " ").slice(0, 60);
+      const nw = Math.min(vwidth(qn) + 3, Math.max(7, rightW - 11));
+      mrows.push(row([
+        { text: "┃", w: 1, fg: GREEN, bg: BG, b: true },
+        { text: " " + qn + ": ", w: nw, fg: m.fromMe ? GREEN : avColorFor(qn), bg: BG, b: true },
+        { text: qt, w: Math.max(4, rightW - 1 - nw), fg: MUTED, bg: BG },
+      ]));
+    }
     // stickers: mostrar ruta del archivo para poder verlo/abrirlo
     let dispText = m.text;
     if (m.media?.type === "sticker") {
@@ -946,21 +1248,25 @@ function render() {
     if (!m.mediaPath && m.media && /^\[(imagen|video|documento|audio)\]$/.test(m.text)) {
       dispText = m.dlFail ? m.text.replace("]", " ⚠]") : m.text.replace("]", " ↓]");
     }
-    // foto/video/sticker en Kitty: bloque de imagen dentro del chat + pie con hora
-    let inlineId = null;
+    // foto/video/sticker en Kitty: se reserva el bloque; la imagen se transmite solo si queda visible
+    let inlinePend = null;
     if ((m.media?.type === "image" || m.media?.type === "video" || m.media?.type === "sticker") && m.mediaPath) {
-      const tp = thumbFor(m);
+      const tp = thumbFor(m, near);
       if (tp) {
-        inlineId = gfxEnsure(tp);
-        if (inlineId) {
-          dispText = m.media.type === "video" ? "▶ video · Ctrl+P" : "";
-        }
+        inlinePend = tp;
+        dispText = m.media.type === "video" ? "▶ video · Ctrl+P" : "";
       }
     }
-    if (inlineId) {
+    if (inlinePend) {
       const mrowsIdx = mrows.length;
+      const dw = m.dim?.w > 0 ? m.dim.w : 4;
+      const dh = m.dim?.h > 0 ? m.dim.h : 3;
+      const ratio = (dh / dw) * 0.5; // proporción real con celda 1:2
+      let irows = Math.round(imgCols * ratio), icols = imgCols;
+      if (irows > 12) { irows = 12; icols = Math.max(12, Math.round(irows / ratio)); }
+      if (irows < 3) { irows = 3; icols = Math.min(imgCols, Math.max(12, Math.round(irows / ratio))); }
       const edgeFg = m.fromMe ? GREEN : MUTED;
-      for (let bi = 0; bi < IMG_ROWS; bi++) {
+      for (let bi = 0; bi < irows; bi++) {
         const bar = isSel && bi === 0 ? "▸" : "│";
         if (m.fromMe) {
           mrows.push(row([
@@ -975,8 +1281,31 @@ function render() {
         }
       }
       // las propias a la derecha, como en el móvil
-      const pcol = m.fromMe ? leftW + 2 + (rightW - imgCols) : leftW + 3;
-      gfxPlaces.push({ mrowsIdx, id: inlineId, cols: imgCols, col: pcol });
+      const pcol = m.fromMe ? leftW + 2 + (rightW - icols) : leftW + 3;
+      gfxPlaces.push({ mrowsIdx, thumb: inlinePend, cols: icols, col: pcol, rows: irows, msg: m });
+    } else if (KITTY_GFX && (m.media?.type === "image" || m.media?.type === "video" || m.media?.type === "sticker") && (m.mediaPath ? !thumbFail.has(`${m.mediaPath}.thumb.png`) : !m.dlFail)) {
+      // esqueleto de cargando: se ve qué viene en camino y la foto lo cubre al estar lista
+      const skR = 6, skC = Math.max(12, Math.min(rightW - 8, 32));
+      const skLabel = m.mediaPath ? "▒ cargando vista…" : "↓ descargando…";
+      const skMid = Math.floor(skR / 2);
+      const edgeFg = m.fromMe ? GREEN : MUTED;
+      for (let bi = 0; bi < skR; bi++) {
+        const txt = bi === skMid
+          ? "░".repeat(Math.max(0, Math.floor((skC - vwidth(skLabel)) / 2))) + skLabel : "";
+        if (m.fromMe) {
+          mrows.push(row([
+            { text: "", w: Math.max(0, rightW - 1 - skC), bg: BG },
+            { text: txt, w: skC, fg: MUTED, bg: BG },
+            { text: "│", w: 1, fg: edgeFg, bg: BG },
+          ]));
+        } else {
+          mrows.push(row([
+            { text: "│", w: 1, fg: edgeFg, bg: BG },
+            { text: txt, w: skC, fg: MUTED, bg: BG },
+            { text: "", w: Math.max(0, rightW - 1 - skC), bg: BG },
+          ]));
+        }
+      }
     }
     // burbujas estilo WhatsApp: propias verdes a la derecha, ajenas grises a la izquierda
     const maxBW = Math.max(12, Math.min(rightW - 14, 48));
@@ -984,7 +1313,8 @@ function render() {
       if (!dispText) {
         // foto sola: solo hora
         mrows.push(row([
-          { text: "", w: Math.max(1, rightW - 10), bg: BG },
+          { text: "", w: Math.max(1, rightW - 11), bg: BG },
+          { text: "▌", w: 1, fg: GREEN, bg: BG, b: true },
           { text: (isSel ? "▸ " : "") + t + " ✓", w: 10, fg: MUTED, bg: BG, align: "right" },
         ]));
         return;
@@ -994,15 +1324,18 @@ function render() {
       body.forEach((ln, bi) => {
         const last = bi === body.length - 1;
         mrows.push(row([
-          { text: last && isSel ? "▸" : "", w: Math.max(1, rightW - bw - 8), fg: GREEN, bg: BG, align: "right", b: isSel },
+          { text: last && isSel ? "▸" : "", w: Math.max(1, rightW - bw - 9), fg: GREEN, bg: BG, align: "right", b: isSel },
+          { text: "▌", w: 1, fg: GREEN, bg: BG, b: true },
           { text: ` ${ln} `, w: bw, fg: B_TXT, bg: B_OUT },
           { text: last ? t + " ✓" : "", w: 8, fg: MUTED, bg: BG, align: "right" },
         ]));
       });
     } else {
+      if (RG && m.name) mrows.push(row([{ text: " " + cleanName(m.name), w: rightW, fg: avColorFor(m.name), bg: BG, b: true }]));
       if (!dispText) {
         mrows.push(row([
-          { text: isSel ? "▸ " : "  ", w: 2, fg: GREEN, bg: BG, b: isSel },
+          { text: isSel ? "▸" : " ", w: 1, fg: GREEN, bg: BG, b: isSel },
+          { text: "▌", w: 1, fg: avColorFor(m.name), bg: BG, b: true },
           { text: t, w: 6, fg: MUTED, bg: BG },
           { text: "", w: Math.max(0, rightW - 8), bg: BG },
         ]));
@@ -1010,10 +1343,12 @@ function render() {
       }
       const body = wrap(dispText, maxBW);
       const bw = Math.min(rightW - 10, Math.max(...body.map((ln) => vwidth(ln))) + 2);
+      const barFg = avColorFor(m.name);
       body.forEach((ln, bi) => {
         const last = bi === body.length - 1;
         mrows.push(row([
-          { text: bi === 0 ? (isSel ? "▸ " : "  ") : "  ", w: 2, fg: GREEN, bg: BG, b: isSel && bi === 0 },
+          { text: bi === 0 ? (isSel ? "▸" : " ") : " ", w: 1, fg: GREEN, bg: BG, b: isSel && bi === 0 },
+          { text: "▌", w: 1, fg: barFg, bg: BG, b: true },
           { text: ` ${ln} `, w: bw, fg: B_TXT, bg: B_IN },
           { text: last ? t : "", w: 6, fg: MUTED, bg: BG },
           { text: "", w: Math.max(0, rightW - 8 - bw), bg: BG },
@@ -1031,15 +1366,17 @@ function render() {
     return timeLabel(ts).toUpperCase();
   };
   const dayChip = (day) => {
-    const label = ` ${day} `;
+    const label = `─ ${day} ─`;
     const pad = Math.max(0, Math.floor((rightW - vwidth(label)) / 2));
     return row([
       { text: "", w: pad, bg: BG },
-      { text: label, w: vwidth(label), fg: MUTED, bg: SURFACE },
+      { text: label, w: vwidth(label), fg: MUTED, bg: SURFACE, b: true },
       { text: "", w: Math.max(0, rightW - pad - vwidth(label)), bg: BG },
     ]);
   };
   let lastDay = "";
+  let RG = false; // ver quién habla en grupos: nombre de color sobre sus burbujas
+  RG = !activeIsStatus && !!active && isGroupJid(active.jid);
   if (active) {
     const c = activeIsStatus ? null : chatFor(active.jid);
     const msgs = activeIsStatus ? (activeEntry?.items || []) : (c?.messages || []);
@@ -1056,7 +1393,10 @@ function render() {
         slice.forEach((m, si) => {
           const d = dayName(m.ts);
           if (d !== lastDay) { lastDay = d; mrows.push(dayChip(d)); }
-          pushMsg(m, baseIdx + si === selIdx);
+          const mi = baseIdx + si;
+          const r0 = mrows.length;
+          pushMsg(m, mi === selIdx, mi >= items.length - 25);
+          for (let i = r0; i < mrows.length; i++) rowMsg[i] = mi;
         });
       }
     } else {
@@ -1066,7 +1406,10 @@ function render() {
       slice.forEach((m, si) => {
           const d = dayName(m.ts);
           if (d !== lastDay) { lastDay = d; mrows.push(dayChip(d)); }
-          pushMsg(m, baseIdx + si === selIdx);
+          const mi = baseIdx + si;
+          const r0 = mrows.length;
+          pushMsg(m, mi === selIdx, mi >= msgs.length - 25);
+          for (let i = r0; i < mrows.length; i++) rowMsg[i] = mi;
         });
     }
   }
@@ -1083,10 +1426,13 @@ function render() {
   const gfxSeqs = [];
   for (const p of gfxPlaces) {
     const k = p.mrowsIdx - winStart;
-    if (k < 0 || k + IMG_ROWS >= shownMsgs.length) continue; // bloque fuera de vista o cortado (no pintar sobre el compositor)
+    if (k < 0 || k + p.rows > shownMsgs.length) continue; // bloque fuera de vista o cortado (no pintar sobre el compositor)
+    probeDim(p.msg, p.thumb); // dimensiones en fondo para encajar a la medida
+    const id = gfxEnsure(p.thumb); // solo aquí viajan los datos (lo visible)
+    if (!id) continue;
     const termRow = msgBase + k + 3; // +2 barra superior +1 base-1
     const termCol = p.col || leftW + 3; // propias a la derecha, ajenas a la izquierda
-    gfxSeqs.push(`\x1b[${termRow};${termCol}H\x1b_Ga=p,i=${p.id},c=${p.cols},r=${IMG_ROWS}\x1b\\`);
+    gfxSeqs.push(`\x1b[${termRow};${termCol}H\x1b_Ga=p,i=${id},c=${p.cols},r=${p.rows}\x1b\\`);
   }
   right[1] = row([{ text: " " + statusText(), w: rightW, fg: MUTED, bg: BG }]);
   while (right.length < inputRuleRow) right.push(row([{ text: "", w: rightW, bg: BG }]));
@@ -1096,13 +1442,13 @@ function render() {
   const pillW = Math.max(20, rightW - sendW - 1);
   const empty = ui.input.length === 0;
   const destName = active ? (activeIsStatus ? active.name.replace(/^📖 /, "") : nameFor(active.jid)).slice(0, 18) : "—";
-  const attName = ui.attach?.file ? path.basename(ui.attach.file).slice(0, 16) : null;
+  const attName = ui.attach?.file ? cleanName(path.basename(ui.attach.file)).slice(0, 16) : null;
   const ctxLabel = ui.replyTo
     ? `↩ ${ui.replyTo.snippet.slice(0, 28)}`
     : attName ? `📎 ${attName}` : activeIsStatus ? `📖 Solo lectura` : `💬 ${destName}`;
   const topInner = `─ ${ctxLabel} `;
   right.push(row([
-    { text: `╭${topInner}${"─".repeat(Math.max(0, pillW - 2 - vwidth(topInner)))}╮`, w: pillW, fg: BORDER, bg: BG },
+    { text: `╭${topInner}${"─".repeat(Math.max(0, pillW - 2 - vwidth(topInner)))}╮`, w: pillW, fg: GREEN, bg: BG },
     { text: "", w: Math.max(0, rightW - pillW), bg: BG },
   ]));
 
@@ -1142,17 +1488,17 @@ function render() {
     caretInfo = { r: rows - 1, c: leftW + 9 + bw, ch: chUnder || " ", w: cw };
   }
   right.push(row([
-    { text: "│", w: 1, fg: BORDER, bg: BG },
+    { text: "│", w: 1, fg: GREEN, bg: BG },
     { text: " 🙂📎 ", w: 6, fg: MUTED, bg: BG },
     ...inputSegs,
-    { text: "│", w: 1, fg: BORDER, bg: BG },
+    { text: "│", w: 1, fg: GREEN, bg: BG },
     { text: " ", w: 1, bg: BG },
     { text: " ", w: 1, bg: BG },
     { text: "➤", w: 3, fg: BG, bg: GREEN, b: true },
     { text: " ", w: 1, bg: BG },
   ]));
   right.push(row([
-    { text: `╰${"─".repeat(pillW - 2)}╯`, w: pillW, fg: BORDER, bg: BG },
+    { text: `╰${"─".repeat(pillW - 2)}╯`, w: pillW, fg: GREEN, bg: BG },
     { text: "", w: Math.max(0, rightW - pillW), bg: BG },
   ]));
   ui._caret = caretInfo; // para el parpadeo sin redibujar
@@ -1194,7 +1540,7 @@ function render() {
     if (a.sel >= a.top + maxRows) a.top = a.sel - maxRows + 1;
     const pickerRows = maxRows + 2; // lista + header + footer
     const pickerTop = Math.max(3, inputRuleRow - pickerRows + 1); // termina justo sobre la caja
-    right[pickerTop] = row([{ text: ` 📎 ${shortDir(a.dir)}`, w: rightW, fg: GREEN, bg: SURFACE, b: true }]);
+    right[pickerTop] = row([{ text: ` 📎 ${cleanName(shortDir(a.dir))}`, w: rightW, fg: GREEN, bg: SURFACE, b: true }]);
     for (let r = 0; r < maxRows; r++) {
       const lineIdx = pickerTop + 1 + r;
       if (lineIdx >= right.length) break;
@@ -1202,7 +1548,7 @@ function render() {
       if (!e) { right[lineIdx] = row([{ text: "", w: rightW, bg: SURFACE }]); continue; }
       const sel = a.top + r === a.sel;
       right[lineIdx] = row([
-        { text: ` ${sel ? "▸" : " "} ${e.isDir ? "📁" : "📄"} ${e.name}`, w: rightW - 10, fg: sel ? GREEN : (e.isDir ? RECV : MUTED), bg: sel ? SEL_BG : SURFACE, b: sel },
+        { text: ` ${sel ? "▸" : " "} ${e.isDir ? "📁" : "📄"} ${cleanName(e.name)}`, w: rightW - 10, fg: sel ? GREEN : (e.isDir ? RECV : MUTED), bg: sel ? SEL_BG : SURFACE, b: sel },
         { text: e.isDir ? "<dir>" : fmtSize(e.size), w: 10, fg: MUTED, bg: sel ? SEL_BG : SURFACE, align: "right" },
       ]);
     }
@@ -1210,57 +1556,93 @@ function render() {
   }
 
   // ---------- barra superior: ventanas en recuadros + dónde estás ----------
-  const chatsUnread = [...chats.values()].reduce((a, c) => a + (c.unread || 0), 0);
-  const statusUnread = [...statusMap.values()].reduce((a, e) => a + (e.unread || 0), 0);
-  const tabBadge = { chats: chatsUnread, contacts: 0, status: statusUnread };
-  let tabInner = TABS.map((t) => ` ${t.label}${tabBadge[t.id] ? `(${tabBadge[t.id]})` : ""} `);
-  let boxesW = tabInner.map((s) => vwidth(s) + 2).reduce((a, b) => a + b, 0) + (TABS.length - 1);
-  if (boxesW > cols - 24) {
-    // terminal angosta: recuadros sin contadores
-    tabInner = TABS.map((t) => ` ${t.label} `);
-    boxesW = tabInner.map((s) => vwidth(s) + 2).reduce((a, b) => a + b, 0) + (TABS.length - 1);
-  }
-  const tabLabel = TABS.find((t) => t.id === ui.tab).label;
-  const whereName = active ? (activeIsStatus ? active.name : nameFor(active.jid)) : "—";
+  const tabDef = TABS.map((t) => ({ id: t.id, label: t.label }));
+  const nb = {};
+  for (const c of chats.values()) nb.chats = (nb.chats || 0) + (c.unread || 0);
+  for (const e of statusMap.values()) nb.status = (nb.status || 0) + (e.unread || 0);
+  const innerFor = (withBadge) => tabDef.map((t) => ` ${t.label}${withBadge && nb[t.id] ? `(${nb[t.id]})` : ""} `);
+  let tabInner = innerFor(true);
+  const widthOf = (inners) => inners.map((s) => vwidth(s) + 2).reduce((a, b) => a + b, 0) + (inners.length - 1);
+  if (widthOf(tabInner) > cols - 24) tabInner = innerFor(false); // angosta: sin contadores
+  const boxesW = widthOf(tabInner);
+  const cur = tabDef.find((t) => t.id === ui.tab) || tabDef[0];
   const crumbW = Math.max(1, cols - boxesW);
   const topRow = [], midRow = [];
-  TABS.forEach((t, i) => {
-    const on = t.id === ui.tab;
+  const tabBoxes = [];
+  let tabX = 1;
+  tabDef.forEach((t, i) => {
+    const on = t.id === cur.id;
     const w = vwidth(tabInner[i]) + 2;
-    topRow.push({ text: `╭${"─".repeat(vwidth(tabInner[i]))}╮`, w, fg: on ? GREEN : BORDER, bg: BG, b: on });
-    midRow.push({ text: `│${tabInner[i]}│`, w, fg: on ? GREEN : MUTED, bg: on ? SEL_BG : BG, b: on });
-    if (i < TABS.length - 1) {
+    tabBoxes.push({ id: t.id, x0: tabX, x1: tabX + w - 1 });
+    tabX += w + 1;
+    const top = `╭${"─".repeat(vwidth(tabInner[i]))}╮`;
+    const mid = `│${tabInner[i]}│`;
+    topRow.push({ text: top, w, fg: on ? GREEN : BORDER, bg: BG, b: on });
+    midRow.push({ text: mid, w, fg: on ? GREEN : MUTED, bg: on ? SEL_BG : BG, b: on });
+    if (i < tabDef.length - 1) {
       topRow.push({ text: " ", w: 1, bg: BG });
       midRow.push({ text: " ", w: 1, bg: BG });
     }
   });
-  topRow.push({ text: ` ${tabLabel} › ${whereName}`, w: crumbW, fg: RECV, bg: BG, b: true });
+  const whereName = active ? (activeIsStatus ? active.name : nameFor(active.jid)) : "—";
+  topRow.push({ text: ` ${cur.label} › ${whereName}`, w: crumbW, fg: RECV, bg: BG, b: true });
   midRow.push({ text: "", w: crumbW, bg: BG });
   const topbar0 = row(topRow);
   const topbar1 = row(midRow);
+  ui._layout = {
+    rows, leftW, rightW, tabBoxes,
+    padTop, winStart, shownLen: shownMsgs.length, rowMsg,
+    sendBtn: { r: inputRuleRow + 4, c0: leftW + rightW - 4, c1: leftW + rightW + 1 },
+    iconBtns: { r: inputRuleRow + 4, e0: leftW + 4, e1: leftW + 5, a0: leftW + 6, a1: leftW + 7 },
+  };
 
   // ---------- componer ----------
-  const sep = paint("│", { color: BORDER, bgc: BG });
-  let out = "\x1b[2J\x1b[H" + topbar0 + "\r\n" + topbar1 + "\r\n";
-  for (let i = 0; i < rows - 2; i++) {
-    out += (left[i] || cell("", leftW, null, BG)) + sep + (right[i] || cell("", rightW, null, BG)) + "\r\n";
+  // Sin 2J por defecto (doc oficial Kitty: 2J borra TODAS las imágenes): se borran
+  // solo las colocaciones (a=d conserva los datos) y se re-coloca por id.
+  // 2J solo al redimensionar o primer frame.
+  const sep = paint("┃", { color: BORDER, bgc: BG });
+  const sizeChanged = cols !== lastCols || rows !== lastRows;
+  lastCols = cols;
+  lastRows = rows;
+  const doClear = sizeChanged || needClear || process.env.WA_FULLDRAW === "1";
+  needClear = false;
+  if (doClear) gfxIds.clear(); // 2J libera datos: lo visible se re-transmite en este frame
+  // Total EXACTO de rows líneas: si sobra una, la pantalla hace scroll y el menú
+  // superior se sale. Con aviso se omite la última fila (borde de la caja).
+  const toastOn = ui.toast && Date.now() < ui.toastUntil;
+  const nContent = toastOn ? rows - 3 : rows - 2;
+  let out = (doClear ? "\x1b[2J\x1b[H" : "\x1b[H") + topbar0 + "\r\n" + topbar1 + "\r\n";
+  for (let i = 0; i < nContent; i++) {
+    out += (left[i] || cell("", leftW, null, BG)) + sep + (right[i] || cell("", rightW, null, BG)) + "\x1b[K\r\n";
   }
+  if (KITTY_GFX && lastPlaced > 0) out += "\x1b_Ga=d\x1b\\";
+  for (const a of avSeqs) {
+    const aid = gfxEnsure(a.thumb);
+    if (aid) gfxSeqs.push(`\x1b[${a.row};${a.col}H\x1b_Ga=p,i=${aid},c=4,r=2\x1b\\`);
+  }
+  lastPlaced = gfxSeqs.length;
   if (gfxQueue.length || gfxSeqs.length) {
     out += gfxQueue.join("") + gfxSeqs.join("") + `\x1b[${rows + 1};1H`;
   }
-  if (ui.toast && Date.now() < ui.toastUntil) {
+  // El aviso ocupa el lugar de la última fila (ver arriba): el blink lo muestra
+  // al aparecer y lo quita al expirar (lastToastOn), así no queda rancio.
+  if (toastOn) {
     out += paint(clampPad("  " + ui.toast, cols), { color: GREEN, bgc: BG, b: true }) + "\r\n";
   }
   process.stdout.write(out);
 }
 function setToast(msg, ms = 3000) {
-  ui.toast = msg;
+  ui.toast = String(msg ?? "").replace(/[\r\n]+/g, " ");
   ui.toastUntil = Date.now() + ms;
+}
+function cleanName(s) {
+  return String(s ?? "").replace(/[\0-\x1f\x7f]/g, "").replace(/\s+/g, " ").trim() || "—";
 }
 function draw() {
   if (suspended) return;
   render();
   ensureVisibleMedia();
+  ensureAvatars();
 }
 function caretTick() {
   // parpadeo del cursor sin redibujar todo (evita que las fotos parpadeen)
@@ -1281,6 +1663,7 @@ function cleanup() {
   process.exit(0);
 }
 let mouseBuf = ""; // trozos de secuencias de ratón partidas entre lecturas
+let rowMsg = []; // mapa fila->mensaje del último render (clic)
 function handleWheel(seq) {
   const m = seq.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
   if (!m || m[4] !== "M") return;
@@ -1293,10 +1676,11 @@ function handleWheel(seq) {
 function onKey(data) {
   let k = mouseBuf + data.toString("utf8");
   mouseBuf = "";
-  k = k.replace(/\x1b\[<\d+(;\d+)*[Mm]/g, (seq) => { handleWheel(seq); return ""; });
+  k = k.replace(/\x1b\[<\d+(;\d+)*[Mm]/g, (seq) => { handleWheel(seq); handleClickSGR(seq); return ""; });
   const tail = k.match(/\x1b\[<\d*(;\d*)*$/);
   if (tail && tail[0]) { mouseBuf = tail[0]; k = k.slice(0, -tail[0].length); }
   if (!k) return;
+  if (k.startsWith("\x1b_G")) return; // respuesta del protocolo gráfico: ignorar sin redibujar
   if (k === "\u0003") return cleanup();
 
   // --- selector de emojis ---
@@ -1376,17 +1760,20 @@ function onKey(data) {
   else if (k === "\u000f") { openMediaSelected(); return; }
   else if (k === "\u0010") { playMediaTerminal(); return; }
   else if (k === "\u0012") { setReplyTo(); return; }
+  else if (k === "\u001br" || k === "\u001bR") { replyToStatus(); return; }
   else if (k === "\u0006") { openAttach(); return; }
   else if (k === "\u001b") { if (ui.replyTo) ui.replyTo = null; else if (ui.delArm) ui.delArm = null; else if (ui.attach) ui.attach = null; else if (ui.msgSel != null) ui.msgSel = null; else ui.input = ""; }
-  else if (k === "\r" || k === "\n") {
-    if (ui.attach?.file) { const cap = ui.input; ui.input = ""; sendAttachment(cap); return; }
-    if (ui.input.trim()) { const t = ui.input.trim(); ui.input = ""; handleCommand(t); }
-  } else if (k === "\u007f" || k === "\b") backspaceAtCursor();
+  else if (k === "\r" || k === "\n") pressEnter();
+  else if (k === "\u007f" || k === "\b") backspaceAtCursor();
   else if (k.length === 1 && k >= " ") insertAtCursor(k);
   else if (k.length > 1 && !k.startsWith("\u001b")) insertAtCursor(k.replace(/[\r\n]/g, ""));
   draw();
 }
 
+function pressEnter() {
+  if (ui.attach?.file) { const cap = ui.input; ui.input = ""; sendAttachment(cap); return; }
+  if (ui.input.trim()) { const t = ui.input.trim(); ui.input = ""; handleCommand(t); }
+}
 function activeMessages(active) {
   if (!active) return { msgs: [], isStatus: false };
   if (active.isStatus) return { msgs: statusMap.get(active.author)?.items || [], isStatus: true };
@@ -1483,10 +1870,14 @@ async function ensureMediaFile(m) {
   m.mediaPath = file;
   m.dlFail = false;
   saveStore();
+  probeFileDim(m, file);
   draw();
   return file;
 }
 let suspended = false; // true mientras un reproductor externo usa la terminal
+let lastPlaced = 0; // fotos colocadas en el último frame (para reponerlas si el terminal las suelta)
+let lastCols = 0, lastRows = 0; // 2J solo al redimensionar
+let needClear = true; // primer frame y navegaciones: limpieza total
 function suspendUI() {
   suspended = true;
   process.off("SIGINT", cleanup);
@@ -1502,6 +1893,7 @@ function resumeUI() {
   process.stdin.on("data", onKey);
   process.on("SIGINT", cleanup);
   suspended = false;
+  gfxIds.clear(); // al salir/entrar de pantalla el terminal pudo soltar datos: re-transmitir
   draw();
 }
 // Reproduce el video/audio/imagen en la terminal con mpv (q o Esc para salir)
@@ -1649,10 +2041,12 @@ async function sendFile(to, file, kind, caption) {
   }
   let contextInfo = null;
   if (ui.replyTo) {
-    const raw = msgCache.get(ui.replyTo.msgId);
-    if (!raw?.message) throw new Error("cita caducada: elige de nuevo con AvPag + Ctrl+R");
+    const orig = findOrigMessage(ui.replyTo.msgId);
+    const qm = buildQuote(orig);
+    if (!qm) throw new Error("ese mensaje ya no está disponible");
     to = ui.replyTo.to;
-    contextInfo = { stanzaId: ui.replyTo.msgId, participant: ui.replyTo.participant, quotedMessage: raw.message };
+    contextInfo = { stanzaId: ui.replyTo.msgId, participant: ui.replyTo.participant, quotedMessage: qm };
+    ui._quote = orig ? { text: String(orig.text || ""), name: orig.name || "alguien" } : null;
     ui.replyTo = null;
   }
   const sent = await sock.sendMessage(to, contextInfo ? { ...payload, contextInfo } : payload);
@@ -1660,7 +2054,9 @@ async function sendFile(to, file, kind, caption) {
   const c = ensureChat(to);
   c.lastTs = Date.now() / 1000;
   ui.msgOff = 0;
-    c.messages.push({ id: sent?.key?.id, fromMe: true, text: disp, ts: c.lastTs, name: "tú", media: { type: mediaType, mimetype: mediaMime, remoteJid: to }, mediaPath, participant: sent?.key?.participant || null, remoteJid: to });
+    const qmine = contextInfo && ui._quote ? ui._quote : null;
+    ui._quote = null;
+    c.messages.push({ id: sent?.key?.id, fromMe: true, text: disp, ts: c.lastTs, name: "tú", media: { type: mediaType, mimetype: mediaMime, remoteJid: to }, mediaPath, participant: sent?.key?.participant || null, remoteJid: to, quote: qmine });
   if (c.messages.length > MAX_MSGS_PER_CHAT) c.messages.splice(0, c.messages.length - MAX_MSGS_PER_CHAT);
   saveStore();
   return disp;
@@ -1777,9 +2173,20 @@ async function sendText(text) {
   const target = getActive();
   if (!target) return;
   if (target.isStatus && !ui.replyTo) {
-    setToast("Los estados son solo lectura — elige uno y pulsa Ctrl+R para responderle por chat");
-    draw();
-    return;
+    // responder historias sin teclas: se cita su último estado y va por su chat
+    const items = statusMap.get(target.author)?.items || [];
+    const lastSt = items[items.length - 1];
+    if (!lastSt || !buildQuote(lastSt)) {
+      setToast("Ese contacto ya no tiene estados visibles");
+      draw();
+      return;
+    }
+    ui.replyTo = {
+      msgId: lastSt.id,
+      participant: lastSt.participant || target.author,
+      snippet: String(lastSt.text).replace(/\s+/g, " ").slice(0, 40),
+      to: target.author,
+    };
   }
   if (String(target.jid).endsWith("@demo")) {
     setToast("Contacto de ejemplo: no se envía");
@@ -1789,24 +2196,28 @@ async function sendText(text) {
     let to = target.isStatus ? target.author : target.jid;
     let contextInfo = null;
     if (ui.replyTo) {
-      const raw = msgCache.get(ui.replyTo.msgId);
-      if (!raw?.message) {
+      const orig = findOrigMessage(ui.replyTo.msgId);
+      const qm = buildQuote(orig);
+      if (!qm) {
         ui.input = text; // no se pierde lo escrito
         ui.cursor = null;
         ui.replyTo = null;
-        setToast("Ese mensaje ya salió de caché: elígelo de nuevo con AvPag + Ctrl+R");
+        setToast("Ese mensaje ya no está disponible");
         draw();
         return;
       }
       to = ui.replyTo.to;
-      contextInfo = { stanzaId: ui.replyTo.msgId, participant: ui.replyTo.participant, quotedMessage: raw.message };
+      contextInfo = { stanzaId: ui.replyTo.msgId, participant: ui.replyTo.participant, quotedMessage: qm };
+      ui._quote = orig ? { text: String(orig.text || ""), name: orig.name || "alguien" } : null;
       ui.replyTo = null;
     }
     const sent = await sock.sendMessage(to, contextInfo ? { text, contextInfo } : { text });
     cacheMsg(sent);
     const c = ensureChat(to);
     c.lastTs = Date.now() / 1000;
-    c.messages.push({ id: sent?.key?.id, fromMe: true, text, ts: c.lastTs, name: "tú", participant: sent?.key?.participant || null, remoteJid: to });
+    const qmine = contextInfo && ui._quote ? ui._quote : null;
+    ui._quote = null;
+    c.messages.push({ id: sent?.key?.id, fromMe: true, text, ts: c.lastTs, name: "tú", participant: sent?.key?.participant || null, remoteJid: to, quote: qmine });
     ui.msgOff = 0;
     if (c.messages.length > MAX_MSGS_PER_CHAT) c.messages.splice(0, c.messages.length - MAX_MSGS_PER_CHAT);
     saveStore();
@@ -1898,6 +2309,7 @@ async function start() {
     getMessage: async (key) => msgCache.get(key.id)?.message,
   });
   sock = s;
+  selfJid = authState.creds.me?.id || selfJid;
   s.ev.on("creds.update", saveCreds);
 
   s.ev.on("messaging-history.set", ({ chats: hs = [], contacts: hc = [], messages: hm = [] }) => {
@@ -1968,16 +2380,7 @@ async function start() {
           const last = st.items[st.items.length - 1];
           setToast(`📖 Estado de ${st.name || m.pushName || "alguien"}: ${last.text.slice(0, 40)}`);
           if (last.media && (last.media.type === "image" || last.media.type === "video")) {
-            downloadMedia(last.id, last.media).then((file) => {
-              if (file) {
-                last.mediaPath = file;
-                saveStore();
-                draw();
-              } else {
-                last.dlFail = true;
-                draw();
-              }
-            });
+            downloadMedia(last.id, last.media).then((file) => afterDownload(last, file));
           }
         }
         continue;
@@ -1990,16 +2393,7 @@ async function start() {
         setToast(`🔔 ${nameFor(m.key.remoteJid || m.key.remoteJidAlt)}: ${last.text.slice(0, 40)}`);
         // auto-descargar imagen/video/sticker entrante
         if (last.media && (last.media.type === "image" || last.media.type === "video" || last.media.type === "sticker")) {
-          downloadMedia(last.id, last.media).then((file) => {
-            if (file) {
-              last.mediaPath = file;
-              saveStore();
-              draw();
-            } else {
-              last.dlFail = true;
-              draw();
-            }
-          });
+          downloadMedia(last.id, last.media).then((file) => afterDownload(last, file));
         }
       }
     }
@@ -2031,6 +2425,11 @@ if (process.env.DUMP) {
   if (process.env.INPUT) ui.input = process.env.INPUT;
   if (process.env.CURSOR && /^\d+$/.test(process.env.CURSOR)) ui.cursor = Number(process.env.CURSOR);
   if (process.env.MSGOFF && /^\d+$/.test(process.env.MSGOFF)) ui.msgOff = Number(process.env.MSGOFF);
+  if (process.env.CLICK) {
+    const [cx, cy] = String(process.env.CLICK).split(",").map(Number);
+    if (cx > 0 && cy > 0) { draw(); handleClick(cx, cy); }
+  }
+  if (process.env.TOAST) setToast(process.env.TOAST, 60000);
   if (process.env.ATTACH) readAttachDir(os.homedir());
   draw();
   process.exit(0);
@@ -2062,6 +2461,7 @@ process.on("SIGINT", cleanup);
 
 let lastToastOn = false;
 let lastMinute = -1;
+
 const blinkTimer = setInterval(() => {
   ui.blink = !ui.blink;
   const toastOn = !!(ui.toast && Date.now() < ui.toastUntil);
@@ -2076,6 +2476,12 @@ const blinkTimer = setInterval(() => {
   }
 }, 550);
 blinkTimer.unref?.();
+
+// keep-alive: si hay fotos en pantalla, redibujar cada 25 s las repone
+// (sin actividad no hay redibujados y el terminal puede soltarlas)
+setInterval(() => {
+  if (lastPlaced > 0 && !suspended) draw();
+}, 25000).unref?.();
 
 if (!KITTY_GFX) setToast(IN_TMUX ? "En tmux las fotos no salen: sal de tmux o pon allow-passthrough on (o WA_GFX=1)" : "Tu terminal no muestra fotos inline (usa Kitty, o Ctrl+O para verlas)", 8000);
 draw();
