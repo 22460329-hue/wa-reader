@@ -1,0 +1,17 @@
+pkgbase = wa-reader
+	pkgdesc = WhatsApp en la terminal (TUI): chats, contactos y estados con fotos inline
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/22460329-hue/wa-reader
+	arch = any
+	license = MIT
+	makedepends = npm
+	depends = nodejs>=18
+	depends = mpv
+	depends = ffmpeg
+	depends = xdg-utils
+	optdepends = kitty: fotos dentro del chat
+	source = wa-reader-1.0.0.tar.gz::https://github.com/22460329-hue/wa-reader/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = 3e5cff2755666b1e83d57fed0391b60d0ec53cb9ab253dd23917749e4bbc55ac
+
+pkgname = wa-reader

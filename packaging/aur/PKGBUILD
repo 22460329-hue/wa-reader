@@ -1,0 +1,25 @@
+# Maintainer: 22460329-hue <22460329-hue@users.noreply.github.com>
+pkgname=wa-reader
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="WhatsApp en la terminal (TUI): chats, contactos y estados con fotos inline"
+arch=('any')
+url="https://github.com/22460329-hue/wa-reader"
+license=('MIT')
+depends=('nodejs>=18' 'mpv' 'ffmpeg' 'xdg-utils')
+makedepends=('npm')
+optdepends=('kitty: fotos dentro del chat')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# sha256 del tarball del tag v1.0.0
+sha256sums=('3e5cff2755666b1e83d57fed0391b60d0ec53cb9ab253dd23917749e4bbc55ac')
+build() {
+  cd "$pkgname-$pkgver"
+  npm install --omit=dev --no-audit --no-fund
+}
+package() {
+  cd "$pkgname-$pkgver"
+  install -d "$pkgdir/usr/lib/wa-reader"
+  cp -r chatui.js package.json package-lock.json node_modules "$pkgdir/usr/lib/wa-reader/"
+  install -Dm755 packaging/aur/wa-reader.sh "$pkgdir/usr/bin/wa-reader"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,17 @@
+# Sesión y datos personales (NO subir)
+auth_info/
+store.json
+qr.png
+*.log
+msgdump.jsonl
+
+# Descargas multimedia
+media/
+
+# Dependencias
+node_modules/
+
+# Sistema / editores
+.DS_Store
+*.swp
+*~
