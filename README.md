@@ -2,6 +2,29 @@
 
 WhatsApp en la terminal (TUI) para Linux. Lee y responde mensajes desde tu número personal, con estética de terminal oscura, fotos dentro del chat y pestañas para Chats, Contactos y Estados. Sin navegador: usa [Baileys](https://github.com/WhiskeySockets/Baileys) (WebSocket puro).
 
+## Descarga rápida (desde tu terminal)
+
+```bash
+git clone https://github.com/22460329-hue/wa-reader.git
+cd wa-reader
+npm install
+npm start
+```
+
+Todo junto:
+
+```bash
+git clone https://github.com/22460329-hue/wa-reader.git && cd wa-reader && npm install && npm start
+```
+
+La primera vez sale el **QR en la pantalla**: escanéalo desde WhatsApp y entras a tus chats. Para actualizar después: `git pull && npm install`.
+
+## Aviso legal (léeme)
+
+- Todo lo relacionado con **WhatsApp® es propiedad de WhatsApp LLC / Meta**. Este proyecto **no está afiliado, respaldado ni certificado** por ellos.
+- wa-reader es solo un **puente**: un cliente no oficial de código abierto que habla con los servidores de WhatsApp mediante la librería Baileys. No queremos demandas: si eres titular de derechos y algo te afecta, abre un *issue* y lo atendemos.
+- ⚠️ Usar clientes no oficiales **viola los Términos de Servicio de WhatsApp** y tu número podría ser suspendido. Úsalo bajo tu propia responsabilidad.
+
 ## Características
 
 - 💬 **Chats, Contactos y Estados** en pestañas (`Tab`), con recuadros y tu ubicación siempre visible
@@ -64,7 +87,7 @@ DEMO=1 npm start
 
 ## Notas
 
-- ⚠️ Cliente no oficial: usarlo viola los Términos de WhatsApp y tu número podría ser sancionado. Úsalo bajo tu responsabilidad.
+- Riesgo de ban y responsabilidad: ver [Aviso legal](#aviso-legal-léeme).
 - Solo **una instancia** a la vez (otra sesión la reemplaza).
 - WhatsApp no reenvía historial a sesiones vinculadas: verás mensajes y estados nuevos desde que lo abras.
 - Los enlaces de fotos viejas caducan: lo nuevo se descarga solo; lo viejo muestra `↓`/`⚠` y se reintenta al abrir el chat.
